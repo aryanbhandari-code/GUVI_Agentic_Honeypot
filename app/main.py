@@ -1,9 +1,9 @@
 from fastapi import FastAPI, BackgroundTasks, Depends
-from typing import Annotated
+from typing import Annotated, Any, Dict
 from dotenv import load_dotenv
 
 # Import Project Modules
-from app.models import IncomingRequest, FinalCallbackPayload, ExtractedIntelligence
+from app.models import FinalCallbackPayload, ExtractedIntelligence
 from app.internal.scanner import Scanner
 from app.internal.llm_engine import LLMEngine
 from app.internal.state_manager import StateManager
@@ -20,30 +20,41 @@ state_manager = StateManager()
 
 @app.post("/honey-pot")
 async def honey_pot_endpoint(
-    request: IncomingRequest, 
+    # CHANGE: Accept raw dictionary to bypass validation errors
+    raw_body: Dict[str, Any], 
     background_tasks: BackgroundTasks,
     x_api_key: Annotated[str, Depends(verify_api_key)] 
 ):
-    # 1. Extract Data
-    session_id = request.sessionId
-    incoming_text = request.message.text
+    # --- 1. Manual Parsing (The "Fail-Safe" Way) ---
     
-    # 2. Retrieve State
+    # Handle sessionId vs sessionld (both spellings)
+    session_id = raw_body.get("sessionId") or raw_body.get("sessionld") or "unknown_session"
+    
+    # Handle message (safely handle if it's a dict OR a string)
+    msg_data = raw_body.get("message", {})
+    if isinstance(msg_data, dict):
+        incoming_text = msg_data.get("text", "")
+    else:
+        incoming_text = str(msg_data)
+        
+    # Handle history (safely ignore if missing)
+    raw_history = raw_body.get("conversationHistory", [])
+    clean_history = []
+    if isinstance(raw_history, list):
+        for h in raw_history:
+            if isinstance(h, dict):
+                clean_history.append(h)
+            
+    # --- 2. Core Logic ---
     current_session = state_manager.get_or_create_session(session_id)
-
-    # 3. Analyze Message
     extracted_data = scanner.extract_intelligence(incoming_text)
-    
-    # 4. Update Database
     state_manager.update_state(session_id, extracted_data)
     current_session = state_manager.get_or_create_session(session_id)
 
-    # 5. Generate Reply
-    # Convert Pydantic objects to dicts for the LLM
-    history_dicts = [h.model_dump() for h in request.conversationHistory]
-    reply_text = llm_engine.generate_reply(history_dicts, incoming_text)
+    # Generate Reply
+    reply_text = llm_engine.generate_reply(clean_history, incoming_text)
 
-    # 6. Check Termination
+    # --- 3. Check Termination ---
     intel = current_session["intelligence"]
     has_critical_info = (len(intel["bankAccounts"]) > 0 or 
                          len(intel["upilds"]) > 0 or 
@@ -67,7 +78,7 @@ async def honey_pot_endpoint(
         )
         background_tasks.add_task(send_final_report, final_payload)
 
-    # Return plain dict for maximum compatibility with the Tester
+    # --- 4. Return Plain JSON ---
     return {
         "status": "success",
         "reply": reply_text
